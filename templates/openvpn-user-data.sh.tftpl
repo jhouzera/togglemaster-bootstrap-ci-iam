@@ -1,0 +1,123 @@
+#!/bin/bash
+# Provisiona o OpenVPN no primeiro boot (Ubuntu 24.04). Gerado por templatefile() em vpn.tf.
+# Log completo: /var/log/openvpn-bootstrap.log (acessivel via SSM Session Manager).
+set -euo pipefail
+exec > >(tee -a /var/log/openvpn-bootstrap.log) 2>&1
+# O aws-cli vem por snap; o PATH do cloud-init nao inclui /snap/bin.
+export PATH="$PATH:/snap/bin"
+
+AWS_REGION="${aws_region}"
+VPN_PUBLIC_IP="${vpn_public_ip}"
+VPN_PORT="${vpn_port}"
+VPN_CLIENT_CIDR="${vpn_client_cidr}"
+EASYRSA_DIR=/etc/openvpn/easy-rsa
+SERVER_DIR=/etc/openvpn/server
+
+echo ">> Instalando pacotes"
+export DEBIAN_FRONTEND=noninteractive
+echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections
+echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
+apt-get update -y
+apt-get install -y openvpn easy-rsa iptables-persistent
+snap wait system seed.loaded
+snap install aws-cli --classic
+
+echo ">> Gerando PKI (EC prime256v1)"
+rm -rf "$EASYRSA_DIR"
+make-cadir "$EASYRSA_DIR"
+cd "$EASYRSA_DIR"
+export EASYRSA_BATCH=1 EASYRSA_ALGO=ec EASYRSA_CURVE=prime256v1 EASYRSA_REQ_CN="togglemaster-vpn-ca"
+./easyrsa init-pki
+./easyrsa build-ca nopass
+./easyrsa build-server-full server nopass
+%{ for name, arn in client_secrets ~}
+./easyrsa build-client-full "${name}" nopass
+%{ endfor ~}
+
+install -d -m 0750 "$SERVER_DIR"
+install -m 0644 pki/ca.crt "$SERVER_DIR/ca.crt"
+openssl x509 -in pki/issued/server.crt -out "$SERVER_DIR/server.crt"
+install -m 0600 pki/private/server.key "$SERVER_DIR/server.key"
+openvpn --genkey secret "$SERVER_DIR/tls-crypt.key"
+chmod 0600 "$SERVER_DIR/tls-crypt.key"
+
+echo ">> Configurando servidor"
+cat > "$SERVER_DIR/server.conf" <<EOF
+port $VPN_PORT
+proto udp
+dev tun
+topology subnet
+server ${client_network} ${client_netmask}
+%{ for net in routed_networks ~}
+push "route ${net.network} ${net.netmask}"
+%{ endfor ~}
+ca ca.crt
+cert server.crt
+key server.key
+dh none
+ecdh-curve prime256v1
+tls-crypt tls-crypt.key
+tls-version-min 1.2
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+auth SHA256
+keepalive 10 60
+user nobody
+group nogroup
+persist-key
+persist-tun
+status /var/log/openvpn/status.log
+verb 3
+explicit-exit-notify 1
+EOF
+
+echo ">> Habilitando roteamento e NAT"
+echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-openvpn.conf
+sysctl --system
+IFACE="$(ip route show default | awk '{print $5; exit}')"
+iptables -t nat -C POSTROUTING -s "$VPN_CLIENT_CIDR" -o "$IFACE" -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -s "$VPN_CLIENT_CIDR" -o "$IFACE" -j MASQUERADE
+netfilter-persistent save
+
+systemctl enable --now openvpn-server@server
+
+echo ">> Publicando perfis de cliente no Secrets Manager"
+build_profile() {
+  local name="$1"
+  cat <<EOF
+client
+dev tun
+proto udp
+remote $VPN_PUBLIC_IP $VPN_PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+auth SHA256
+verb 3
+<ca>
+$(cat "$SERVER_DIR/ca.crt")
+</ca>
+<cert>
+$(openssl x509 -in "pki/issued/$name.crt")
+</cert>
+<key>
+$(cat "pki/private/$name.key")
+</key>
+<tls-crypt>
+$(cat "$SERVER_DIR/tls-crypt.key")
+</tls-crypt>
+EOF
+}
+
+umask 077
+%{ for name, arn in client_secrets ~}
+build_profile "${name}" > "/root/${name}.ovpn"
+aws secretsmanager put-secret-value --region "$AWS_REGION" \
+  --secret-id "${arn}" --secret-string "file:///root/${name}.ovpn" >/dev/null
+rm -f "/root/${name}.ovpn"
+echo "   perfil ${name} publicado"
+%{ endfor ~}
+
+echo ">> OpenVPN pronto"

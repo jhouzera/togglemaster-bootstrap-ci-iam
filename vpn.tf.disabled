@@ -1,0 +1,231 @@
+# DESATIVADO: a VPN nao e pre-requisito da entrega; os acessos sao liberados por IP.
+# Para reativar: renomeie para vpn.tf e mova os outputs do fim deste arquivo para outputs.tf.
+
+# VPN de administracao (OpenVPN) do ToggleMaster.
+#
+# Fica numa VPC propria para sobreviver aos destroys do togglemaster-iac. O togglemaster-iac
+# localiza esta VPC e a route table pelas tags Name e cria o peering com a VPC da plataforma.
+# Todo acesso administrativo (API do EKS, RDS, Redis, ArgoCD, Grafana) passa por aqui.
+#
+# A PKI e gerada na propria instancia no primeiro boot. Cada perfil de cliente (.ovpn com
+# certificados inline) e gravado no Secrets Manager em <projeto>-<env>/vpn/<cliente>.
+# Recriar a instancia gera uma PKI nova e sobrescreve os perfis: baixe-os de novo.
+
+locals {
+  vpn_name_prefix = "${var.project_name}-${var.environment}-vpn"
+
+  vpn_tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Component   = "vpn"
+  }
+}
+
+data "aws_ssm_parameter" "vpn_ami" {
+  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+}
+
+resource "aws_vpc" "vpn" {
+  cidr_block           = var.vpn_vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(local.vpn_tags, { Name = "${local.vpn_name_prefix}-vpc" })
+}
+
+resource "aws_internet_gateway" "vpn" {
+  vpc_id = aws_vpc.vpn.id
+
+  tags = merge(local.vpn_tags, { Name = "${local.vpn_name_prefix}-igw" })
+}
+
+resource "aws_subnet" "vpn_public" {
+  vpc_id            = aws_vpc.vpn.id
+  cidr_block        = var.vpn_subnet_cidr
+  availability_zone = var.vpn_availability_zone
+
+  tags = merge(local.vpn_tags, { Name = "${local.vpn_name_prefix}-public" })
+}
+
+# O togglemaster-iac adiciona aqui a rota de volta para a VPC da plataforma (via peering).
+resource "aws_route_table" "vpn_public" {
+  vpc_id = aws_vpc.vpn.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.vpn.id
+  }
+
+  tags = merge(local.vpn_tags, { Name = "${local.vpn_name_prefix}-public-rt" })
+
+  # Rotas de peering sao gerenciadas pelo togglemaster-iac (aws_route); nao remover aqui.
+  lifecycle {
+    ignore_changes = [route]
+  }
+}
+
+resource "aws_route_table_association" "vpn_public" {
+  subnet_id      = aws_subnet.vpn_public.id
+  route_table_id = aws_route_table.vpn_public.id
+}
+
+resource "aws_security_group" "vpn" {
+  name        = "${local.vpn_name_prefix}-sg"
+  description = "OpenVPN: apenas a porta UDP do tunel; administracao via SSM"
+  vpc_id      = aws_vpc.vpn.id
+
+  ingress {
+    description = "OpenVPN"
+    from_port   = var.vpn_port
+    to_port     = var.vpn_port
+    protocol    = "udp"
+    cidr_blocks = var.vpn_allowed_cidrs
+  }
+
+  egress {
+    description = "Saida para internet e para a VPC da plataforma (peering)"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.vpn_tags, { Name = "${local.vpn_name_prefix}-sg" })
+}
+
+# Perfis de cliente: o Terraform controla o ciclo de vida; a instancia so grava o valor.
+resource "aws_secretsmanager_secret" "vpn_client" {
+  for_each = toset(var.vpn_clients)
+
+  name                    = "${var.project_name}-${var.environment}/vpn/${each.key}"
+  description             = "Perfil OpenVPN (.ovpn) do cliente ${each.key}"
+  recovery_window_in_days = 0
+
+  tags = local.vpn_tags
+}
+
+resource "aws_iam_role" "vpn" {
+  name = "${local.vpn_name_prefix}-instance-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "ec2.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = local.vpn_tags
+}
+
+resource "aws_iam_role_policy_attachment" "vpn_ssm" {
+  role       = aws_iam_role.vpn.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "vpn_client_secrets" {
+  name = "${local.vpn_name_prefix}-client-secrets"
+  role = aws_iam_role.vpn.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:PutSecretValue"]
+        Resource = [for secret in aws_secretsmanager_secret.vpn_client : secret.arn]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "vpn" {
+  name = "${local.vpn_name_prefix}-instance-profile"
+  role = aws_iam_role.vpn.name
+}
+
+# Criado antes da instancia para que o IP publico entre no perfil .ovpn.
+resource "aws_eip" "vpn" {
+  domain = "vpc"
+
+  tags = merge(local.vpn_tags, { Name = "${local.vpn_name_prefix}-eip" })
+}
+
+resource "aws_instance" "vpn" {
+  ami                    = data.aws_ssm_parameter.vpn_ami.value
+  instance_type          = var.vpn_instance_type
+  subnet_id              = aws_subnet.vpn_public.id
+  vpc_security_group_ids = [aws_security_group.vpn.id]
+  iam_instance_profile   = aws_iam_instance_profile.vpn.name
+
+  # Mudanca no user_data so tem efeito com uma instancia nova (cloud-init roda no primeiro boot).
+  user_data_replace_on_change = true
+  user_data = templatefile("${path.module}/templates/openvpn-user-data.sh.tftpl", {
+    aws_region      = var.aws_region
+    vpn_public_ip   = aws_eip.vpn.public_ip
+    vpn_port        = var.vpn_port
+    client_network  = cidrhost(var.vpn_client_cidr, 0)
+    client_netmask  = cidrnetmask(var.vpn_client_cidr)
+    vpn_client_cidr = var.vpn_client_cidr
+    routed_networks = [for cidr in var.vpn_routed_cidrs : { network = cidrhost(cidr, 0), netmask = cidrnetmask(cidr) }]
+    client_secrets  = { for name, secret in aws_secretsmanager_secret.vpn_client : name => secret.arn }
+  })
+
+  # t3 nasce em modo "unlimited", que pode gerar cobranca acima do free tier.
+  credit_specification {
+    cpu_credits = "standard"
+  }
+
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
+  }
+
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = 8
+    encrypted             = true
+    delete_on_termination = true
+  }
+
+  tags = merge(local.vpn_tags, { Name = "${local.vpn_name_prefix}-server" })
+
+  # Evita recriar a VPN (e invalidar os perfis) a cada nova AMI publicada.
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
+  depends_on = [
+    aws_iam_role_policy.vpn_client_secrets,
+    aws_route_table_association.vpn_public
+  ]
+}
+
+resource "aws_eip_association" "vpn" {
+  instance_id   = aws_instance.vpn.id
+  allocation_id = aws_eip.vpn.id
+}
+
+output "vpn_public_ip" {
+  description = "IP publico (EIP) do servidor OpenVPN"
+  value       = aws_eip.vpn.public_ip
+}
+
+output "vpn_instance_id" {
+  description = "ID da instancia da VPN (acesso administrativo via SSM Session Manager)"
+  value       = aws_instance.vpn.id
+}
+
+output "vpn_vpc_id" {
+  description = "VPC dedicada da VPN (o togglemaster-iac cria o peering com ela)"
+  value       = aws_vpc.vpn.id
+}
+
+output "vpn_client_secret_names" {
+  description = "Secrets com os perfis .ovpn de cada cliente"
+  value       = { for name, secret in aws_secretsmanager_secret.vpn_client : name => secret.name }
+}

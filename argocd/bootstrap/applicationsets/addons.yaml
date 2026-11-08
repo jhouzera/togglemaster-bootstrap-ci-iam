@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: togglemaster-addons
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/jhouzera/togglemaster-addons.git
+        revision: main
+        directories:
+          - path: addons/*
+  template:
+    metadata:
+      name: '{{path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/jhouzera/togglemaster-addons.git
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{path.basename}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
