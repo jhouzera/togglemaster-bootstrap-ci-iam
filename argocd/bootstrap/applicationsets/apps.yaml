@@ -1,0 +1,64 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: togglemaster-apps
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - name: togglemaster-auth
+            namespace: auth
+            repoURL: https://github.com/jhouzera/togglemaster-gitops.git
+            path: charts/togglemaster
+            targetRevision: main
+            valuesFile: environments/dev/apps/auth-values.yaml
+          - name: togglemaster-flag
+            namespace: flag
+            repoURL: https://github.com/jhouzera/togglemaster-gitops.git
+            path: charts/togglemaster
+            targetRevision: main
+            valuesFile: environments/dev/apps/flag-values.yaml
+          - name: togglemaster-targeting
+            namespace: targeting
+            repoURL: https://github.com/jhouzera/togglemaster-gitops.git
+            path: charts/togglemaster
+            targetRevision: main
+            valuesFile: environments/dev/apps/targeting-values.yaml
+          - name: togglemaster-evaluation
+            namespace: evaluation
+            repoURL: https://github.com/jhouzera/togglemaster-gitops.git
+            path: charts/togglemaster
+            targetRevision: main
+            valuesFile: environments/dev/apps/evaluation-values.yaml
+          - name: togglemaster-analytics
+            namespace: analytics
+            repoURL: https://github.com/jhouzera/togglemaster-gitops.git
+            path: charts/togglemaster
+            targetRevision: main
+            valuesFile: environments/dev/apps/analytics-values.yaml
+  template:
+    metadata:
+      name: '{{name}}'
+    spec:
+      project: default
+      sources:
+        - repoURL: '{{repoURL}}'
+          targetRevision: '{{targetRevision}}'
+          path: '{{path}}'
+          helm:
+            valueFiles:
+              - values.yaml
+              - $values/{{valuesFile}}
+        - repoURL: '{{repoURL}}'
+          targetRevision: '{{targetRevision}}'
+          ref: values
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
